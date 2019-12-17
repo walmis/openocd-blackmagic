@@ -164,6 +164,8 @@ if XDS110
 DRIVERFILES += %D%/xds110.c
 endif
 
+DRIVERFILES += %D%/blackmagic.c
+
 DRIVERHEADERS = \
 	%D%/bitbang.h \
 	%D%/bitq.h \

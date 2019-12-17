@@ -64,6 +64,12 @@ static const struct hl_layout hl_layouts[] = {
 	 .api = &stlink_usb_layout_api,
 	 },
 	{
+	 .name = "blackmagic",
+	 .open = hl_layout_open,
+	 .close = hl_layout_close,
+	 .api = &blackmagic_layout_api,
+	 },
+	{
 	 .name = "ti-icdi",
 	 .open = hl_layout_open,
 	 .close = hl_layout_close,
