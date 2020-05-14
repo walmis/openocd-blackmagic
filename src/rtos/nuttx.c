@@ -126,33 +126,38 @@ static const struct rtos_register_stacking nuttx_stacking_cortex_m = {
 	nuttx_stack_offsets_cortex_m   /* register_offsets */
 };
 
+#define REGOFF(x) (x*4)
+
 static const struct stack_register_offset nuttx_stack_offsets_cortex_m_fpu[] = {
-	{ ARMV7M_R0,	0x6c, 32 },		/* r0   */
-	{ ARMV7M_R1,	0x70, 32 },		/* r1   */
-	{ ARMV7M_R2,	0x74, 32 },		/* r2   */
-	{ ARMV7M_R3,	0x78, 32 },		/* r3   */
-	{ ARMV7M_R4,	0x08, 32 },		/* r4   */
-	{ ARMV7M_R5,	0x0c, 32 },		/* r5   */
-	{ ARMV7M_R6,	0x10, 32 },		/* r6   */
-	{ ARMV7M_R7,	0x14, 32 },		/* r7   */
-	{ ARMV7M_R8,	0x18, 32 },		/* r8   */
-	{ ARMV7M_R9,	0x1c, 32 },		/* r9   */
-	{ ARMV7M_R10,	0x20, 32 },		/* r10  */
-	{ ARMV7M_R11,	0x24, 32 },		/* r11  */
-	{ ARMV7M_R12,	0x7c, 32 },		/* r12  */
-	{ ARMV7M_R13,	  0,  32 },		/* sp   */
-	{ ARMV7M_R14,	0x80, 32 },		/* lr   */
-	{ ARMV7M_PC,	0x84, 32 },		/* pc   */
-	{ ARMV7M_xPSR,	0x88, 32 },		/* xPSR */
+	{ ARMV7M_R0,	REGOFF(__REG_R0), 32 },		/* r0   */
+	{ ARMV7M_R1,	REGOFF(__REG_R1), 32 },		/* r1   */
+	{ ARMV7M_R2,	REGOFF(__REG_R2), 32 },		/* r2   */
+	{ ARMV7M_R3,	REGOFF(__REG_R3), 32 },		/* r3   */
+	{ ARMV7M_R4,	REGOFF(__REG_R4), 32 },		/* r4   */
+	{ ARMV7M_R5,	REGOFF(__REG_R5), 32 },		/* r5   */
+	{ ARMV7M_R6,	REGOFF(__REG_R6), 32 },		/* r6   */
+	{ ARMV7M_R7,	REGOFF(__REG_R7), 32 },		/* r7   */
+	{ ARMV7M_R8,	REGOFF(__REG_R8), 32 },		/* r8   */
+	{ ARMV7M_R9,	REGOFF(__REG_R9), 32 },		/* r9   */
+	{ ARMV7M_R10,	REGOFF(__REG_R10), 32 },		/* r10  */
+	{ ARMV7M_R11,	REGOFF(__REG_R11), 32 },		/* r11  */
+	{ ARMV7M_R12,	REGOFF(__REG_R12), 32 },		/* r12  */
+	{ ARMV7M_R13,	REGOFF(__REG_R13),  32 },		/* sp   */
+	{ ARMV7M_R14,	REGOFF(__REG_R14), 32 },		/* lr   */
+	{ ARMV7M_PC,	REGOFF(__REG_R15), 32 },		/* pc   */
+	{ ARMV7M_xPSR,	REGOFF(__REG_XPSR), 32 },		/* xPSR */
 };
 
 static const struct rtos_register_stacking nuttx_stacking_cortex_m_fpu = {
-	0x8c,                                   /* stack_registers_size */
+	XCPTCONTEXT_SIZE,                      /* stack_registers_size */
 	-1,                                     /* stack_growth_direction */
 	17,                                     /* num_output_registers */
 	0,                                      /* stack_alignment */
 	nuttx_stack_offsets_cortex_m_fpu        /* register_offsets */
 };
+
+
+
 
 static int pid_offset = PID;
 static int state_offset = STATE;
@@ -352,7 +357,8 @@ static int nuttx_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 	bool cm4_fpu_enabled = false;
 	struct armv7m_common *armv7m_target = target_to_armv7m(rtos->target);
 	if (is_armv7m(armv7m_target)) {
-		if (armv7m_target->fp_feature == FPv4_SP) {
+	    //printf("armv7m_target->fp_feature %x %x\n", armv7m_target->fp_feature, FPv4_SP);
+		if (armv7m_target->fp_feature != 0) {
 			/* Found ARM v7m target which includes a FPU */
 			uint32_t cpacr;
 
@@ -365,6 +371,7 @@ static int nuttx_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 			/* Check if CP10 and CP11 are set to full access. */
 			if (cpacr & 0x00F00000) {
 				/* Found target with enabled FPU */
+				
 				cm4_fpu_enabled = 1;
 			}
 		}
