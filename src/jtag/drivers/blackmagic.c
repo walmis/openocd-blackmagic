@@ -38,6 +38,12 @@
 #include <stddef.h>
 #include <errno.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+
 #define RESP_TIMEOUT 500
 
 /* Protocol error messages */
@@ -104,7 +110,7 @@
 
 struct bmp_handle {
 	int fd;
-
+	int is_socket;
 };
 
 #define NTOH(x) ((x<=9)?x+'0':'a'+x-10)
@@ -119,6 +125,14 @@ struct bmp_handle {
 static int bmp_write_mem (void *handle, uint32_t addr, uint32_t mem_width,
 		uint32_t count, const uint8_t *buffer);
 static int bmp_write_debug_reg (void *handle, uint32_t addr, uint32_t val);
+
+static int bmp_send(struct bmp_handle *priv, void* buf, int len, int flags) {
+	if(priv->is_socket) {
+		return send(priv->fd, buf, len, flags);
+	} else {
+		return write(priv->fd, buf, len);
+	}
+}
 
 static int set_interface_attribs(int fd, int speed, int parity)
 
@@ -222,29 +236,96 @@ static int bmp_buffer_read(struct bmp_handle *priv, uint8_t *data, int maxsize)
 	return -3;
 }
 
+static int resolve_hostname(char *hostname , struct sockaddr_in * addr)
+{
+	struct addrinfo hints, *servinfo, *p;
+	int rv;
 
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC; // use AF_INET6 to force IPv6
+	hints.ai_socktype = SOCK_STREAM;
+
+	if ( (rv = getaddrinfo( hostname , 0 , &hints , &servinfo)) != 0)
+	{
+		LOG_ERROR("Failed to resolve %s (%s)", hostname, gai_strerror(rv));
+		return -1;
+	}
+
+	// loop through all the results and connect to the first we can
+	for(p = servinfo; p != NULL; p = p->ai_next)
+	{
+		if(p->ai_addrlen == sizeof(*addr)) {
+			memcpy(addr, p->ai_addr, sizeof(*addr));
+			break;
+		}
+	}
+
+	freeaddrinfo(servinfo); // all done with this structure
+	return 0;
+}
 
 /** */
 static int bmp_open (struct hl_interface_param_s *param, void **handle) {
 	LOG_DEBUG("bmp_open");
 	int ret;
-	struct bmp_handle* priv = malloc(sizeof(struct bmp_handle));
+	struct bmp_handle* priv = calloc(1, sizeof(struct bmp_handle));
 	*handle = priv;
 
-	char* serial = "/dev/ttyACM0";
+	char* bmp_hostport = getenv("BMP_HOST");
 
-	priv->fd = open(serial, O_RDWR|O_SYNC|O_NOCTTY);
-	if (priv->fd <0 )
-	{
-	  LOG_ERROR("Couldn't open serial port %s\n", serial);
-	  goto err;
+	if(bmp_hostport) {
+		struct sockaddr_in addr;
+
+		char* host = 0;
+
+		int port;
+		sscanf(bmp_hostport, "%m[^:]:%d", &host, &port);
+
+		if(resolve_hostname(host, &addr) == 0) {
+			addr.sin_port = htons(port);
+
+		} else {
+			free(host);
+			goto err;
+		}
+
+		LOG_USER("BMP: Connecting to %s:%d", inet_ntoa(addr.sin_addr), ntohs(port));
+
+		priv->fd = socket(AF_INET, SOCK_STREAM, 0);
+
+		ret = connect(priv->fd, (struct sockaddr*)&addr, sizeof(addr));
+		if(ret == 0) {
+
+		} else {
+			LOG_ERROR("connection to BMP host failed (%s)", strerror(errno));
+			close(priv->fd);
+			goto err;
+		}
+
+		int flags =1;
+		setsockopt(priv->fd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+		setsockopt(priv->fd, IPPROTO_TCP, TCP_QUICKACK, (void *)&flags, sizeof(flags));
+
+	} else {
+		char* serial = getenv("BMP_SERIAL");
+		if(!serial) {
+			serial = "/dev/ttyACM0";
+		}
+
+		priv->fd = open(serial, O_RDWR|O_SYNC|O_NOCTTY);
+		priv->is_socket = 0;
+		if (priv->fd <0 )
+		{
+		  LOG_ERROR("Couldn't open serial port %s\n", serial);
+		  goto err;
+		}
+
+		if (set_interface_attribs (priv->fd, 115000, 0) < 0)
+		{
+			goto err;
+		}
+
 	}
-
-	if (set_interface_attribs (priv->fd, 115000, 0) < 0)
-	{
-		goto err;
-	}
-
 
 	for(int i = 0; i < 4; i++) {
 		ret = write(priv->fd, REMOTE_INIT_SWDP_STR, sizeof(REMOTE_INIT_SWDP_STR));
@@ -262,18 +343,17 @@ static int bmp_open (struct hl_interface_param_s *param, void **handle) {
 		goto err;
 	}
 
-
 err:
+	if(priv->fd) close(priv->fd);
 	free(priv);
 	return ERROR_FAIL;
 }
 /** */
-static int bmp_close (void *handle) {
+static int bmp_close (void* handle) {
 	struct bmp_handle* priv = (struct bmp_handle*)handle;
-	LOG_DEBUG("bmp_close");
 
 	close(priv->fd);
-	free(handle);
+	free(priv);
 
 	return ERROR_OK;
 
@@ -286,7 +366,7 @@ static int bmp_reset (void *handle) {
 	return ERROR_OK;
 	int ret;
 
-	ret = write(priv->fd, REMOTE_RESET_STR, strlen(REMOTE_RESET_STR));
+	ret = bmp_send(priv, REMOTE_RESET_STR, strlen(REMOTE_RESET_STR), 0);
 	if(ret < 0) {
 		LOG_ERROR("%s", strerror(errno));
 		return ERROR_FAIL;
@@ -308,27 +388,21 @@ static int bmp_assert_srst (void *handle, int srst) {
 
 }
 /** */
-static int bmp_run (void *handle) {
-	//struct bmp_handle* priv = (struct bmp_handle*)handle;
-	uint32_t val = DBGKEY|C_DEBUGEN;
-	return bmp_write_mem(handle, DCB_DHCSR, 4, 1, (uint8_t*)&val);
+static int bmp_run (void* handle) {
+	struct bmp_handle* priv = (struct bmp_handle*)handle;
+	return bmp_write_debug_reg(priv, DCB_DHCSR, DBGKEY|C_DEBUGEN);
 }
 /** */
-static int bmp_halt (void *handle) {
-	//struct bmp_handle* priv = (struct bmp_handle*)handle;
-	LOG_DEBUG("bmp_halt");
-
-	uint32_t val = DBGKEY|C_HALT|C_DEBUGEN;
-
-	return bmp_write_mem(handle, DCB_DHCSR, 4, 1, (uint8_t*)&val);
-
+static int bmp_halt (void* handle) {
+	struct bmp_handle* priv = (struct bmp_handle*)handle;
+	return bmp_write_debug_reg(priv, DCB_DHCSR, DBGKEY|C_HALT|C_DEBUGEN);
 }
 /** */
-static int bmp_step (void *handle) {
-
-	bmp_write_debug_reg(handle, DCB_DHCSR, DBGKEY|C_HALT|C_MASKINTS|C_DEBUGEN);
-	bmp_write_debug_reg(handle, DCB_DHCSR, DBGKEY|C_STEP|C_MASKINTS|C_DEBUGEN);
-	return bmp_write_debug_reg(handle, DCB_DHCSR, DBGKEY|C_HALT|C_DEBUGEN);
+static int bmp_step (void* handle) {
+	struct bmp_handle* priv = (struct bmp_handle*)handle;
+	bmp_write_debug_reg(priv, DCB_DHCSR, DBGKEY|C_HALT|C_MASKINTS|C_DEBUGEN);
+	bmp_write_debug_reg(priv, DCB_DHCSR, DBGKEY|C_STEP|C_MASKINTS|C_DEBUGEN);
+	return bmp_write_debug_reg(priv, DCB_DHCSR, DBGKEY|C_HALT|C_DEBUGEN);
 
 }
 /** */
@@ -346,7 +420,7 @@ static int bmp_read_reg (void *handle, int num, uint32_t *val) {
 	char command[512];
 	ret = snprintf(command, sizeof(command), REMOTE_REG_READ_STR, num);
 
-	ret = write(priv->fd, command, ret);
+	ret = bmp_send(priv, command, ret, 0);
 	if(ret < 0) {
 		LOG_ERROR("%s", strerror(errno));
 		return ERROR_FAIL;
@@ -372,7 +446,7 @@ static int bmp_write_reg (void *handle, int num, uint32_t val) {
 	char command[64];
 	ret = snprintf(command, sizeof(command), REMOTE_REG_WRITE_STR, num, val);
 
-	ret = write(priv->fd, command, ret);
+	ret = bmp_send(priv, command, ret, 0);
 	if(ret < 0) {
 		LOG_ERROR("%s", strerror(errno));
 		return ERROR_FAIL;
@@ -401,7 +475,7 @@ static int bmp_read_mem (void *handle, uint32_t addr, uint32_t data_width,
 		count = MIN(read_remaining, bufsize/2);
 
 		size_t num = snprintf(tmpbuf, bufsize, REMOTE_READ_MEM_STR, addr, count);
-		ret = write(priv->fd, tmpbuf, num);
+		ret = bmp_send(priv, tmpbuf, num, 0);
 		if(ret < 0) {
 			LOG_ERROR("%s", strerror(errno));
 			return ERROR_FAIL;
@@ -448,7 +522,7 @@ static int bmp_write_mem (void *handle, uint32_t addr, uint32_t mem_width,
 		count = MIN(chunk_size, total_size)/2;
 		LOG_DEBUG("\t wr chunk: addr: %08x bytes:%d", addr, count);
 		ret = snprintf(command, sizeof(command), REMOTE_WRITE_MEM_STR_BEGIN, addr, count);
-		ret = write(priv->fd, command, ret);
+		ret = bmp_send(priv, command, ret, MSG_MORE);
 
 		ret = hexify(outbuf, buffer, count, buffersize);
 
@@ -456,8 +530,8 @@ static int bmp_write_mem (void *handle, uint32_t addr, uint32_t mem_width,
 		buffer     += count;
 		addr       += count;
 
-		ret = write(priv->fd, outbuf, ret);
-		ret = write(priv->fd, REMOTE_WRITE_MEM_STR_END, strlen(REMOTE_WRITE_MEM_STR_END));
+		ret = bmp_send(priv, outbuf, ret, MSG_MORE);
+		ret = bmp_send(priv, REMOTE_WRITE_MEM_STR_END, strlen(REMOTE_WRITE_MEM_STR_END), 0);
 
 		ret = bmp_buffer_read(priv, (uint8_t*)command, sizeof(command));
 		if(ret > 0 && command[0] == REMOTE_RESP_OK) {
@@ -474,12 +548,8 @@ static int bmp_write_mem (void *handle, uint32_t addr, uint32_t mem_width,
 
 }
 /** */
-static int bmp_write_debug_reg (void *handle, uint32_t addr, uint32_t val) {
-	//struct bmp_handle* priv = (struct bmp_handle*)handle;
-	//LOG_DEBUG("bmp_write_debug_reg");
-
+static int bmp_write_debug_reg (void* handle, uint32_t addr, uint32_t val) {
 	return bmp_write_mem(handle, addr, 4, 1, (void*)&val);
-
 }
 /**
  * Read the idcode of the target connected to the adapter
@@ -559,11 +629,11 @@ static enum target_state bmp_get_status(void *handle)
 	uint8_t  mem[4];
 
 	result = bmp_read_mem(handle, DCB_DHCSR, 4, 1, mem);
+	if  (result != ERROR_OK) {
+		return TARGET_UNKNOWN;
+	}
 	status = le_to_h_u32(mem);
 	enum target_state state;
-
-	if  (result != ERROR_OK)
-		state = TARGET_UNKNOWN;
 
 	if (status & S_HALT)
 		state = TARGET_HALTED;
@@ -571,8 +641,6 @@ static enum target_state bmp_get_status(void *handle)
 		state = TARGET_RESET;
 	else
 		state = TARGET_RUNNING;
-
-	//LOG_DEBUG("bmp_state %d\n", state);
 
 	return state;
 }
