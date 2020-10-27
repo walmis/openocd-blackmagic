@@ -187,7 +187,7 @@ static int bmp_buffer_read(struct bmp_handle *priv, uint8_t *data, int maxsize)
 	uint8_t *c;
 	int s;
 	int ret;
-	fd_set rset;
+	fd_set rset, xset;
 	struct timeval tv;
 	int f = priv->fd;
 
@@ -197,18 +197,37 @@ static int bmp_buffer_read(struct bmp_handle *priv, uint8_t *data, int maxsize)
 
 	/* Look for start of response */
 	do {
-		FD_ZERO(&rset);
-		FD_SET(f, &rset);
+              FD_ZERO(&rset);
+              FD_ZERO(&xset);
+              FD_SET(f, &rset);
+              FD_SET(f, &xset);
 
-		ret = select(f + 1, &rset, NULL, NULL, &tv);
-		if (ret < 0) {
-			return -4;
-		}
-		if (ret == 0) {
-			return -3;
-		}
+              ret = select(f + 1, &rset, NULL, &xset, &tv);
+              if (ret < 0) {
+                      return -4;
+              }
+              if (ret == 0) {
+                      return -3;
+              }
 
-		s = read(f, c, 1);
+              if(FD_ISSET(f, &xset)) {
+                  LOG_ERROR("Read error, closing");
+                  close(f);
+                  priv->fd = -1;
+                  return -5;
+              }
+
+//              size_t len = 0;
+//              ioctl(f, FIONREAD, &len);
+//              if(len == 0) {
+//
+//              }
+              s = read(f, c, 1);
+              if(FD_ISSET(f, &rset) && s == 0) {
+                  LOG_ERROR("Zero lenght read, closing");
+                  close(f);
+                  priv->fd = -1;
+              }
 	} while ((s > 0) && (*c != REMOTE_RESP));
 
 	/* Now collect the response */
@@ -264,91 +283,106 @@ static int resolve_hostname(char *hostname , struct sockaddr_in * addr)
 	return 0;
 }
 
+
+static int bmp_connect (void* handle) {
+
+    int ret;
+    struct bmp_handle* priv = (struct bmp_handle*)handle;
+
+    if(priv->fd > 0) return ERROR_OK;
+
+    char* bmp_hostport = getenv("BMP_HOST");
+
+    if(bmp_hostport) {
+            struct sockaddr_in addr;
+
+            char* host = 0;
+
+            int port;
+            sscanf(bmp_hostport, "%m[^:]:%d", &host, &port);
+
+            if(resolve_hostname(host, &addr) == 0) {
+                    addr.sin_port = htons(port);
+
+            } else {
+                    free(host);
+                    goto err;
+            }
+
+            LOG_USER("BMP: Connecting to %s:%d", inet_ntoa(addr.sin_addr), ntohs(port));
+
+            priv->fd = socket(AF_INET, SOCK_STREAM, 0);
+
+            ret = connect(priv->fd, (struct sockaddr*)&addr, sizeof(addr));
+            if(ret == 0) {
+
+            } else {
+                    LOG_ERROR("connection to BMP host failed (%s)", strerror(errno));
+                    close(priv->fd);
+                    goto err;
+            }
+
+            int flags =1;
+            setsockopt(priv->fd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
+            setsockopt(priv->fd, IPPROTO_TCP, TCP_QUICKACK, (void *)&flags, sizeof(flags));
+
+    } else {
+            char* serial = getenv("BMP_SERIAL");
+            if(!serial) {
+                    serial = "/dev/ttyACM0";
+            }
+
+            priv->fd = open(serial, O_RDWR|O_SYNC|O_NOCTTY);
+            priv->is_socket = 0;
+            if (priv->fd <0 )
+            {
+              LOG_ERROR("Couldn't open serial port %s\n", serial);
+              goto err;
+            }
+
+            if (set_interface_attribs (priv->fd, 115000, 0) < 0)
+            {
+                    goto err;
+            }
+
+    }
+
+    for(int i = 0; i < 4; i++) {
+            ret = write(priv->fd, REMOTE_INIT_SWDP_STR, sizeof(REMOTE_INIT_SWDP_STR));
+            if(ret < 0) {
+                    LOG_ERROR("%s", strerror(errno));
+                    return ERROR_FAIL;
+            }
+
+            uint8_t buf[64];
+            ret = bmp_buffer_read(priv, (uint8_t*)buf, sizeof(buf));
+            if(ret > 0 && buf[0] == REMOTE_RESP_OK)
+                    return ERROR_OK;
+    }
+    if(ret < 0) {
+            goto err;
+    }
+
+err:
+    if(priv->fd) close(priv->fd);
+    return ERROR_FAIL;
+}
 /** */
 static int bmp_open (struct hl_interface_param_s *param, void **handle) {
 	LOG_DEBUG("bmp_open");
-	int ret;
 	struct bmp_handle* priv = calloc(1, sizeof(struct bmp_handle));
 	*handle = priv;
+	priv->fd = -1;
 
-	char* bmp_hostport = getenv("BMP_HOST");
-
-	if(bmp_hostport) {
-		struct sockaddr_in addr;
-
-		char* host = 0;
-
-		int port;
-		sscanf(bmp_hostport, "%m[^:]:%d", &host, &port);
-
-		if(resolve_hostname(host, &addr) == 0) {
-			addr.sin_port = htons(port);
-
-		} else {
-			free(host);
-			goto err;
-		}
-
-		LOG_USER("BMP: Connecting to %s:%d", inet_ntoa(addr.sin_addr), ntohs(port));
-
-		priv->fd = socket(AF_INET, SOCK_STREAM, 0);
-
-		ret = connect(priv->fd, (struct sockaddr*)&addr, sizeof(addr));
-		if(ret == 0) {
-
-		} else {
-			LOG_ERROR("connection to BMP host failed (%s)", strerror(errno));
-			close(priv->fd);
-			goto err;
-		}
-
-		int flags =1;
-		setsockopt(priv->fd, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags));
-		setsockopt(priv->fd, IPPROTO_TCP, TCP_QUICKACK, (void *)&flags, sizeof(flags));
-
-	} else {
-		char* serial = getenv("BMP_SERIAL");
-		if(!serial) {
-			serial = "/dev/ttyACM0";
-		}
-
-		priv->fd = open(serial, O_RDWR|O_SYNC|O_NOCTTY);
-		priv->is_socket = 0;
-		if (priv->fd <0 )
-		{
-		  LOG_ERROR("Couldn't open serial port %s\n", serial);
-		  goto err;
-		}
-
-		if (set_interface_attribs (priv->fd, 115000, 0) < 0)
-		{
-			goto err;
-		}
-
+	int ret = bmp_connect((void*)priv);
+	if(ret != ERROR_OK) {
+	    free(priv);
 	}
-
-	for(int i = 0; i < 4; i++) {
-		ret = write(priv->fd, REMOTE_INIT_SWDP_STR, sizeof(REMOTE_INIT_SWDP_STR));
-		if(ret < 0) {
-			LOG_ERROR("%s", strerror(errno));
-			return ERROR_FAIL;
-		}
-
-		uint8_t buf[64];
-		ret = bmp_buffer_read(priv, (uint8_t*)buf, sizeof(buf));
-		if(ret > 0 && buf[0] == REMOTE_RESP_OK)
-			return ERROR_OK;
-	}
-	if(ret < 0) {
-		goto err;
-	}
-
-err:
-	if(priv->fd) close(priv->fd);
-	free(priv);
-	return ERROR_FAIL;
+	return ret;
 }
+
 /** */
+
 static int bmp_close (void* handle) {
 	struct bmp_handle* priv = (struct bmp_handle*)handle;
 
@@ -630,6 +664,8 @@ static enum target_state bmp_get_status(void *handle)
 
 	result = bmp_read_mem(handle, DCB_DHCSR, 4, 1, mem);
 	if  (result != ERROR_OK) {
+	    	//try reconnect
+	    	bmp_connect(handle);
 		return TARGET_UNKNOWN;
 	}
 	status = le_to_h_u32(mem);
